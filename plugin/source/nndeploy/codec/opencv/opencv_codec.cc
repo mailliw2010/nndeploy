@@ -177,7 +177,11 @@ base::Status OpenCvVideoDecode::setPath(const std::string &path) {
   if (parallel_type_ == base::kParallelTypePipeline) {
     std::lock_guard<std::mutex> lock(path_mutex_);
     path_ = path;
-    if (!base::exists(path_)) {
+    // 检查是否是网络流（RTSP/HTTP/HTTPS），如果是则跳过文件存在性检查
+    bool is_network_stream = (path_.find("rtsp://") == 0) || 
+                             (path_.find("http://") == 0) || 
+                             (path_.find("https://") == 0);
+    if (!is_network_stream && !base::exists(path_)) {
       NNDEPLOY_LOGE("path[%s] is not exists!\n", path_.c_str());
       return base::kStatusCodeErrorInvalidParam;
     }
@@ -195,7 +199,24 @@ base::Status OpenCvVideoDecode::setPath(const std::string &path) {
       cap_ = nullptr;
       return base::kStatusCodeErrorInvalidParam;
     }
-    size_ = (int)cap_->get(cv::CAP_PROP_FRAME_COUNT);
+    // 对于RTSP流，CAP_PROP_FRAME_COUNT可能返回无效值，需要特殊处理
+    int frame_count = (int)cap_->get(cv::CAP_PROP_FRAME_COUNT);
+    if (is_network_stream) {
+      // 网络流，设置为INT_MAX表示无限流
+      size_ = INT_MAX;
+      NNDEPLOY_LOGI("Network stream detected, set size_ to INT_MAX\n");
+    } else if (frame_count > 0) {
+      // 有效的本地视频文件
+      size_ = frame_count;
+      NNDEPLOY_LOGI("Video file with %d frames\n", frame_count);
+    } else {
+      // 无效的帧数且不是网络流，报错
+      NNDEPLOY_LOGE("Invalid frame count %d for non-network video\n", frame_count);
+      cap_->release();
+      delete cap_;
+      cap_ = nullptr;
+      return base::kStatusCodeErrorInvalidParam;
+    }
     fps_ = cap_->get(cv::CAP_PROP_FPS);
     width_ = (int)cap_->get(cv::CAP_PROP_FRAME_WIDTH);
     height_ = (int)cap_->get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -203,7 +224,11 @@ base::Status OpenCvVideoDecode::setPath(const std::string &path) {
     path_cv_.notify_one();  // 通知等待的线程
   } else {
     path_ = path;
-    if (!base::exists(path_)) {
+    // 检查是否是网络流（RTSP/HTTP/HTTPS），如果是则跳过文件存在性检查
+    bool is_network_stream = (path_.find("rtsp://") == 0) || 
+                             (path_.find("http://") == 0) || 
+                             (path_.find("https://") == 0);
+    if (!is_network_stream && !base::exists(path_)) {
       NNDEPLOY_LOGE("path[%s] is not exists!\n", path_.c_str());
       return base::kStatusCodeErrorInvalidParam;
     }
@@ -221,7 +246,24 @@ base::Status OpenCvVideoDecode::setPath(const std::string &path) {
       cap_ = nullptr;
       return base::kStatusCodeErrorInvalidParam;
     }
-    size_ = (int)cap_->get(cv::CAP_PROP_FRAME_COUNT);
+    // 对于RTSP流，CAP_PROP_FRAME_COUNT可能返回无效值，需要特殊处理
+    int frame_count = (int)cap_->get(cv::CAP_PROP_FRAME_COUNT);
+    if (is_network_stream) {
+      // 网络流，设置为INT_MAX表示无限流
+      size_ = INT_MAX;
+      NNDEPLOY_LOGI("Network stream detected, set size_ to INT_MAX\n");
+    } else if (frame_count > 0) {
+      // 有效的本地视频文件
+      size_ = frame_count;
+      NNDEPLOY_LOGI("Video file with %d frames\n", frame_count);
+    } else {
+      // 无效的帧数且不是网络流，报错
+      NNDEPLOY_LOGE("Invalid frame count %d for non-network video\n", frame_count);
+      cap_->release();
+      delete cap_;
+      cap_ = nullptr;
+      return base::kStatusCodeErrorInvalidParam;
+    }
     fps_ = cap_->get(cv::CAP_PROP_FPS);
     width_ = (int)cap_->get(cv::CAP_PROP_FRAME_WIDTH);
     height_ = (int)cap_->get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -245,9 +287,21 @@ base::Status OpenCvVideoDecode::run() {
     // 关键：使用lambda检查条件
     path_cv_.wait(lock, [this] { return path_ready_; });
   }
+  
+  // 检查视频是否成功打开
+  if (cap_ == nullptr || !cap_->isOpened()) {
+    NNDEPLOY_LOGE("Video is not opened. Please check the video file path.\n");
+    return base::kStatusCodeErrorInvalidParam;
+  }
+  
   if (index_ < size_) {
     cv::Mat *mat = new cv::Mat();
-    cap_->read(*mat);
+    bool success = cap_->read(*mat);
+    if (!success || mat->empty()) {
+      NNDEPLOY_LOGE("Failed to read frame from video.\n");
+      delete mat;
+      return base::kStatusCodeErrorInvalidParam;
+    }
     outputs_[0]->set(mat, false);
     // std::string name = "input_" + std::to_string(index_) + ".jpg";
     // std::string full_path = base::joinPath("./", name);
@@ -259,6 +313,7 @@ base::Status OpenCvVideoDecode::run() {
   } else {
     NNDEPLOY_LOGW("Invalid parameter error occurred. index[%d] >=size_[%d].\n ",
                   index_, size_);
+    return base::kStatusCodeErrorInvalidParam;
   }
 
   return base::kStatusCodeOk;
@@ -278,6 +333,7 @@ base::Status OpenCvCameraDecode::deinit() {
 }
 
 base::Status OpenCvCameraDecode::setPath(const std::string &path) {
+  NNDEPLOY_LOGI("OpenCvCameraDecode::setPath() called with path: %s\n", path.c_str());
   if (parallel_type_ == base::kParallelTypePipeline) {
     std::lock_guard<std::mutex> lock(path_mutex_);
     path_ = path;
@@ -358,9 +414,20 @@ base::Status OpenCvCameraDecode::run() {
     // 关键：使用lambda检查条件
     path_cv_.wait(lock, [this] { return path_ready_; });
   }
+  // 检查摄像头是否成功打开
+  if (cap_ == nullptr || !cap_->isOpened()) {
+    NNDEPLOY_LOGE("Camera is not opened. Please check the camera device.\n");
+    return base::kStatusCodeErrorInvalidParam;
+  }
+  
   if (index_ < size_) {
     cv::Mat *mat = new cv::Mat();
-    cap_->read(*mat);
+    bool success = cap_->read(*mat);
+    if (!success || mat->empty()) {
+      NNDEPLOY_LOGE("Failed to read frame from camera.\n");
+      delete mat;
+      return base::kStatusCodeErrorInvalidParam;
+    }
     outputs_[0]->set(mat, false);
     index_++;
     if (index_ == size_) {
@@ -369,6 +436,7 @@ base::Status OpenCvCameraDecode::run() {
   } else {
     NNDEPLOY_LOGW("Invalid parameter error occurred. index[%d] >=size_[%d].\n ",
                   index_, size_);
+    return base::kStatusCodeErrorInvalidParam;
   }
   return base::kStatusCodeOk;
 }
@@ -451,27 +519,43 @@ base::Status OpenCvVideoEncode::setRefPath(const std::string &path) {
     delete cap_;
     cap_ = nullptr;
   }
-  if (base::exists(ref_path_)) {
-    base::Status status = base::kStatusCodeOk;
-    cap_ = new cv::VideoCapture(ref_path_);
+  
+  // 检查是否是网络流
+  bool is_network_stream = (ref_path_.find("rtsp://") == 0) || 
+                           (ref_path_.find("http://") == 0) || 
+                           (ref_path_.find("https://") == 0);
+  
+  // 对于本地文件检查存在性，网络流则跳过
+  if (!is_network_stream && !base::exists(ref_path_)) {
+    NNDEPLOY_LOGE("Reference video file %s does not exist.\n", ref_path_.c_str());
+    return base::kStatusCodeErrorInvalidParam;
+  }
+  
+  base::Status status = base::kStatusCodeOk;
+  cap_ = new cv::VideoCapture(ref_path_);
 
-    if (!cap_->isOpened()) {
-      NNDEPLOY_LOGE("Error: Failed to open video file %s.\n",
-                    ref_path_.c_str());
-      delete cap_;
-      cap_ = nullptr;
-      return base::kStatusCodeErrorInvalidParam;
-    }
-
-    size_ = (int)cap_->get(cv::CAP_PROP_FRAME_COUNT);
-    fps_ = cap_->get(cv::CAP_PROP_FPS);
-    width_ = (int)cap_->get(cv::CAP_PROP_FRAME_WIDTH);
-    height_ = (int)cap_->get(cv::CAP_PROP_FRAME_HEIGHT);
-
-    cap_->release();
+  if (!cap_->isOpened()) {
+    NNDEPLOY_LOGE("Error: Failed to open reference video %s.\n",
+                  ref_path_.c_str());
     delete cap_;
     cap_ = nullptr;
+    return base::kStatusCodeErrorInvalidParam;
   }
+
+  size_ = (int)cap_->get(cv::CAP_PROP_FRAME_COUNT);
+  // 对于RTSP流，frame count可能是无效值，设置为INT_MAX
+  if (is_network_stream && (size_ <= 0 || size_ == INT_MIN)) {
+    size_ = INT_MAX;
+    NNDEPLOY_LOGI("Network stream detected in ref_path, set size_ to INT_MAX\n");
+  }
+  fps_ = cap_->get(cv::CAP_PROP_FPS);
+  width_ = (int)cap_->get(cv::CAP_PROP_FRAME_WIDTH);
+  height_ = (int)cap_->get(cv::CAP_PROP_FRAME_HEIGHT);
+
+  cap_->release();
+  delete cap_;
+  cap_ = nullptr;
+
   return base::kStatusCodeOk;
 }
 
@@ -511,10 +595,12 @@ base::Status OpenCvVideoEncode::run() {
     cv::Mat *mat = inputs_[0]->getCvMat(this);
     if (mat != nullptr) {
       writer_->write(*mat);
+    } else {
+      NNDEPLOY_LOGW("OpenCvVideoEncode::run() frame %d is nullptr!\n", index_);
     }
     index_++;
     if (index_ == size_) {
-      // NNDEPLOY_LOGI("OpenCvVideoEncode::run() writer_->release()\n");
+      NNDEPLOY_LOGI("OpenCvVideoEncode::run() reached size_, releasing writer\n");
       writer_->release();
     }
   } else {
